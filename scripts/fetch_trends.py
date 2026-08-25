@@ -15,8 +15,6 @@ ARCHIVE.mkdir(exist_ok=True)
 client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
 MAX_BYTES = 750 * 1024 * 1024
 PERIOD_WEEKS = {"weekly": 1, "monthly": 4, "yearly": 52}
-# Longer-period views should not be dominated by a single current-week spike.
-MIN_APPEARANCES = {"weekly": 1, "monthly": 1, "yearly": 2}
 
 
 def query(table: str, target: date):
@@ -47,12 +45,14 @@ def find_latest():
     raise RuntimeError("Son 5 günde Türkiye Google Trends partition'ı bulunamadı.")
 
 
-def aggregate(rows, week_count: int, min_appearances: int = 1):
+def aggregate(rows, week_count: int):
     weeks = sorted({r["week"] for r in rows if r.get("week")}, reverse=True)[:week_count]
     week_set = set(weeks)
     if not weeks:
         return {}, []
 
+    # Period score = sum of the available weekly relative-interest scores.
+    # It is an index for ranking within this view, not absolute search volume.
     buckets = defaultdict(lambda: {"score_sum": 0.0, "weeks_seen": set(), "best_rank": 999, "last_week": None})
     for r in rows:
         if r.get("week") not in week_set:
@@ -69,17 +69,13 @@ def aggregate(rows, week_count: int, min_appearances: int = 1):
             b["last_week"] = r["week"]
 
     per_region = defaultdict(list)
-    denom = len(weeks)
     for (region, term), b in buckets.items():
-        appearances = len(b["weeks_seen"])
-        if appearances < min_appearances:
-            continue
         per_region[region].append({
             "term": term,
             "rank": b["best_rank"] if b["best_rank"] != 999 else None,
             "week": b["last_week"].isoformat() if b["last_week"] else None,
-            "score": round(b["score_sum"] / denom, 2),
-            "appearances": appearances,
+            "score": round(b["score_sum"], 2),
+            "appearances": len(b["weeks_seen"]),
         })
 
     for region, items in per_region.items():
@@ -92,24 +88,20 @@ def aggregate(rows, week_count: int, min_appearances: int = 1):
 d, top_rows, rising_rows = find_latest()
 periods = {}
 for period, n_weeks in PERIOD_WEEKS.items():
-    min_app = MIN_APPEARANCES[period]
-    top, top_weeks = aggregate(top_rows, n_weeks, min_app)
-    rising, rising_weeks = aggregate(rising_rows, n_weeks, min_app)
+    top, top_weeks = aggregate(top_rows, n_weeks)
+    rising, rising_weeks = aggregate(rising_rows, n_weeks)
     regions = {
         r: {"top": top.get(r, []), "rising": rising.get(r, [])}
         for r in sorted(set(top) | set(rising))
     }
     weeks = top_weeks or rising_weeks
-    periods[period] = {
-        "weeks": weeks,
-        "week_count": len(weeks),
-        "regions": regions,
-    }
+    periods[period] = {"weeks": weeks, "week_count": len(weeks), "regions": regions}
 
 payload = {
     "refresh_date": d.isoformat(),
     "country_code": "TR",
     "source": "bigquery-public-data.google_trends",
+    "period_score_method": "sum_weekly_relative_interest",
     "periods": periods,
     "regions": periods["weekly"]["regions"],
 }
@@ -117,17 +109,5 @@ raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 (ARCHIVE / f"{d.isoformat()}.json").write_text(raw, encoding="utf-8")
 (DATA / "latest.json").write_text(raw, encoding="utf-8")
 dates = sorted(p.stem for p in ARCHIVE.glob("*.json"))
-(DATA / "manifest.json").write_text(
-    json.dumps({
-        "latest": d.isoformat(),
-        "dates": dates,
-        "region_count": len(periods["weekly"]["regions"]),
-        "periods": {k: v["week_count"] for k, v in periods.items()},
-    }, ensure_ascii=False, indent=2),
-    encoding="utf-8",
-)
-print(
-    f"{d}: weekly={periods['weekly']['week_count']}w, "
-    f"monthly={periods['monthly']['week_count']}w, yearly={periods['yearly']['week_count']}w; "
-    f"{len(periods['weekly']['regions'])} regions"
-)
+(DATA / "manifest.json").write_text(json.dumps({"latest": d.isoformat(), "dates": dates, "region_count": len(periods["weekly"]["regions"]), "periods": {k: v["week_count"] for k, v in periods.items()}, "period_score_method": "sum_weekly_relative_interest"}, ensure_ascii=False, indent=2), encoding="utf-8")
+print(f"{d}: weekly={periods['weekly']['week_count']}w, monthly={periods['monthly']['week_count']}w, yearly={periods['yearly']['week_count']}w; {len(periods['weekly']['regions'])} regions")
