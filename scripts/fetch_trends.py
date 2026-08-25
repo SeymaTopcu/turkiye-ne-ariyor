@@ -18,7 +18,7 @@ MAX_BYTES = 750 * 1024 * 1024
 def query_snapshots(table: str, target: date, days: int):
     start = target - timedelta(days=days - 1)
     sql = f"""
-    WITH rows AS (
+    WITH snapshot_rows AS (
       SELECT refresh_date, region_name, term, rank, week, score
       FROM `bigquery-public-data.google_trends.{table}`
       WHERE refresh_date BETWEEN @start_date AND @end_date
@@ -26,11 +26,11 @@ def query_snapshots(table: str, target: date, days: int):
         AND region_name IS NOT NULL
     ), latest_week_per_snapshot AS (
       SELECT refresh_date, MAX(week) AS week
-      FROM rows
+      FROM snapshot_rows
       GROUP BY refresh_date
     )
     SELECT r.refresh_date, r.region_name, r.term, r.rank, r.score
-    FROM rows r
+    FROM snapshot_rows r
     JOIN latest_week_per_snapshot w USING (refresh_date, week)
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY r.refresh_date, r.region_name, r.term
