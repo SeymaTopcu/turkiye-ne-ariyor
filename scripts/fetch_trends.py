@@ -12,12 +12,11 @@ DATA.mkdir(exist_ok=True)
 ARCHIVE.mkdir(exist_ok=True)
 
 client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
-MAX_BYTES = 250 * 1024 * 1024
+# Safety guard: current Turkey snapshot needs ~455 MB. Fail rather than scan >750 MB.
+MAX_BYTES = 750 * 1024 * 1024
 
 
 def query(table: str, target: date):
-    # Each refresh contains historical weekly observations for the current Top 25.
-    # We want one row per current term, so retain the most recent week in that refresh.
     sql = f"""
     WITH snapshot AS (
       SELECT refresh_date, region_code, region_name, term, rank, week, score
@@ -73,13 +72,7 @@ def normalize(rows):
 d, top_rows, rising_rows = find_latest()
 top, rising = normalize(top_rows), normalize(rising_rows)
 regions = {r: {"top": top.get(r, []), "rising": rising.get(r, [])} for r in sorted(set(top) | set(rising))}
-payload = {
-    "refresh_date": d.isoformat(),
-    "country_code": "TR",
-    "source": "bigquery-public-data.google_trends",
-    "note": "Top 25 terms from the refresh snapshot; score is the latest weekly score when Google supplies it.",
-    "regions": regions,
-}
+payload = {"refresh_date": d.isoformat(), "country_code": "TR", "source": "bigquery-public-data.google_trends", "regions": regions}
 raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 (ARCHIVE / f"{d.isoformat()}.json").write_text(raw, encoding="utf-8")
 (DATA / "latest.json").write_text(raw, encoding="utf-8")
