@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import os
+from collections import defaultdict
 from pathlib import Path
 from datetime import date, timedelta
 from google.cloud import bigquery
@@ -12,31 +13,20 @@ DATA.mkdir(exist_ok=True)
 ARCHIVE.mkdir(exist_ok=True)
 
 client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
-# Safety guard: current Turkey snapshot needs ~455 MB. Fail rather than scan >750 MB.
+# A single Turkey partition scan is comfortably below this guard per table.
 MAX_BYTES = 750 * 1024 * 1024
+PERIOD_WEEKS = {"weekly": 1, "monthly": 4, "yearly": 52}
 
 
 def query(table: str, target: date):
     sql = f"""
-    WITH snapshot AS (
-      SELECT refresh_date, region_code, region_name, term, rank, week, score
-      FROM `bigquery-public-data.google_trends.{table}`
-      WHERE refresh_date = @refresh_date
-        AND country_code = 'TR'
-        AND region_name IS NOT NULL
-    ), latest_week AS (
-      SELECT region_code, MAX(week) AS week
-      FROM snapshot
-      GROUP BY region_code
-    )
-    SELECT s.refresh_date, s.region_code, s.region_name, s.term, s.rank, s.week, s.score
-    FROM snapshot s
-    JOIN latest_week w USING (region_code, week)
-    QUALIFY ROW_NUMBER() OVER (
-      PARTITION BY s.region_code, s.term, s.rank
-      ORDER BY s.week DESC
-    ) = 1
-    ORDER BY s.region_name, s.rank
+    SELECT refresh_date, region_code, region_name, term, rank, week, score
+    FROM `bigquery-public-data.google_trends.{table}`
+    WHERE refresh_date = @refresh_date
+      AND country_code = 'TR'
+      AND region_name IS NOT NULL
+      AND week >= DATE_SUB(@refresh_date, INTERVAL 370 DAY)
+    ORDER BY week DESC, region_name, rank
     """
     cfg = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("refresh_date", "DATE", target.isoformat())],
@@ -56,26 +46,87 @@ def find_latest():
     raise RuntimeError("Son 5 günde Türkiye Google Trends partition'ı bulunamadı.")
 
 
-def normalize(rows):
-    out = {}
+def aggregate(rows, week_count: int):
+    weeks = sorted({r["week"] for r in rows if r.get("week")}, reverse=True)[:week_count]
+    week_set = set(weeks)
+    if not weeks:
+        return {}, []
+
+    # A term that appears repeatedly across the selected period should outrank
+    # a one-week spike. Missing weeks count as zero, keeping the period score 0–100.
+    buckets = defaultdict(lambda: {"score_sum": 0.0, "appearances": 0, "best_rank": 999, "last_week": None})
+    names = {}
     for r in rows:
-        region = r["region_name"]
-        out.setdefault(region, []).append({
-            "term": r["term"],
-            "rank": int(r["rank"]) if r.get("rank") is not None else None,
-            "week": r["week"].isoformat() if r.get("week") else None,
-            "score": float(r["score"]) if r.get("score") is not None else None,
+        if r.get("week") not in week_set:
+            continue
+        key = (r["region_name"], r["term"])
+        names[key] = r["term"]
+        b = buckets[key]
+        if r.get("score") is not None:
+            b["score_sum"] += float(r["score"])
+        b["appearances"] += 1
+        if r.get("rank") is not None:
+            b["best_rank"] = min(b["best_rank"], int(r["rank"]))
+        if b["last_week"] is None or r["week"] > b["last_week"]:
+            b["last_week"] = r["week"]
+
+    per_region = defaultdict(list)
+    denom = len(weeks)
+    for (region, term), b in buckets.items():
+        per_region[region].append({
+            "term": term,
+            "rank": b["best_rank"] if b["best_rank"] != 999 else None,
+            "week": b["last_week"].isoformat() if b["last_week"] else None,
+            "score": round(b["score_sum"] / denom, 2),
+            "appearances": b["appearances"],
         })
-    return out
+
+    for region, items in per_region.items():
+        items.sort(key=lambda x: (-x["score"], -x["appearances"], x["rank"] or 999, x["term"]))
+        per_region[region] = items[:25]
+
+    return dict(per_region), [w.isoformat() for w in sorted(weeks)]
 
 
 d, top_rows, rising_rows = find_latest()
-top, rising = normalize(top_rows), normalize(rising_rows)
-regions = {r: {"top": top.get(r, []), "rising": rising.get(r, [])} for r in sorted(set(top) | set(rising))}
-payload = {"refresh_date": d.isoformat(), "country_code": "TR", "source": "bigquery-public-data.google_trends", "regions": regions}
+periods = {}
+for period, n_weeks in PERIOD_WEEKS.items():
+    top, top_weeks = aggregate(top_rows, n_weeks)
+    rising, rising_weeks = aggregate(rising_rows, n_weeks)
+    regions = {
+        r: {"top": top.get(r, []), "rising": rising.get(r, [])}
+        for r in sorted(set(top) | set(rising))
+    }
+    weeks = top_weeks or rising_weeks
+    periods[period] = {
+        "weeks": weeks,
+        "week_count": len(weeks),
+        "regions": regions,
+    }
+
+# Keep top-level regions for backwards compatibility; they equal the weekly view.
+payload = {
+    "refresh_date": d.isoformat(),
+    "country_code": "TR",
+    "source": "bigquery-public-data.google_trends",
+    "periods": periods,
+    "regions": periods["weekly"]["regions"],
+}
 raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 (ARCHIVE / f"{d.isoformat()}.json").write_text(raw, encoding="utf-8")
 (DATA / "latest.json").write_text(raw, encoding="utf-8")
 dates = sorted(p.stem for p in ARCHIVE.glob("*.json"))
-(DATA / "manifest.json").write_text(json.dumps({"latest": d.isoformat(), "dates": dates, "region_count": len(regions)}, ensure_ascii=False, indent=2), encoding="utf-8")
-print(f"{d}: {len(regions)} regions; {len(top_rows)} top; {len(rising_rows)} rising")
+(DATA / "manifest.json").write_text(
+    json.dumps({
+        "latest": d.isoformat(),
+        "dates": dates,
+        "region_count": len(periods["weekly"]["regions"]),
+        "periods": {k: v["week_count"] for k, v in periods.items()},
+    }, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
+print(
+    f"{d}: weekly={periods['weekly']['week_count']}w, "
+    f"monthly={periods['monthly']['week_count']}w, yearly={periods['yearly']['week_count']}w; "
+    f"{len(periods['weekly']['regions'])} regions"
+)
