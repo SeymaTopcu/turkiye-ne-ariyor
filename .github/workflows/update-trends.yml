@@ -1,0 +1,38 @@
+name: Update Google Trends data
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 4 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Authenticate Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+      - name: Fetch real Turkey Trends data
+        env:
+          GCP_PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+        run: python scripts/fetch_trends.py
+      - name: Commit snapshot
+        run: |
+          if git diff --quiet -- data/; then
+            echo "No new data"
+          else
+            git config user.name "trends-bot"
+            git config user.email "trends-bot@users.noreply.github.com"
+            git add data/
+            git commit -m "data: update Google Trends snapshot"
+            git push
+          fi
