@@ -8,5 +8,6 @@
     "weekly": 1,
     "monthly": 4,
     "yearly": 52
-  }
+  },
+  "period_score_method": "sum_weekly_relative_interest"
 }
