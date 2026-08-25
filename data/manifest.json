@@ -3,5 +3,10 @@
   "dates": [
     "2026-08-24"
   ],
-  "region_count": 81
+  "region_count": 81,
+  "periods": {
+    "weekly": 1,
+    "monthly": 4,
+    "yearly": 52
+  }
 }
