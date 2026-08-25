@@ -12,7 +12,8 @@ ARCHIVE = DATA / "archive"
 DATA.mkdir(exist_ok=True)
 ARCHIVE.mkdir(exist_ok=True)
 client = bigquery.Client(project=os.environ["GCP_PROJECT_ID"])
-MAX_BYTES = 750 * 1024 * 1024
+# 30 daily partitions are several GB; keep a safety cap but high enough for the query.
+MAX_BYTES = 20 * 1024 * 1024 * 1024
 
 
 def query_snapshots(table: str, target: date, days: int):
@@ -59,8 +60,6 @@ def find_latest():
 
 
 def aggregate(rows):
-    # rank is comparable within each daily Top-25 set. Reward both frequency
-    # and high placement: rank 1 => 25 points, rank 25 => 1 point.
     buckets = defaultdict(lambda: {"points": 0, "days": set(), "best_rank": 999, "last_date": None})
     for r in rows:
         key = (r["region_name"], r["term"])
@@ -87,7 +86,7 @@ def aggregate(rows):
     return dict(per_region)
 
 
-def make_period(top_rows, rising_rows, snapshot_days):
+def make_period(top_rows, rising_rows):
     top = aggregate(top_rows)
     rising = aggregate(rising_rows)
     regions = {r: {"top": top.get(r, []), "rising": rising.get(r, [])} for r in sorted(set(top) | set(rising))}
@@ -95,17 +94,26 @@ def make_period(top_rows, rising_rows, snapshot_days):
     return {"snapshot_days": len(dates), "dates": dates, "regions": regions}
 
 
+def since(rows, start_date: date):
+    return [r for r in rows if r["refresh_date"] >= start_date]
+
+
 d = find_latest()
-top_1 = query_snapshots("international_top_terms", d, 1)
-rising_1 = query_snapshots("international_top_rising_terms", d, 1)
-top_7 = query_snapshots("international_top_terms", d, 7)
-rising_7 = query_snapshots("international_top_rising_terms", d, 7)
+# Query each table once for 30 days, then derive current and 7-day views locally.
 top_30 = query_snapshots("international_top_terms", d, 30)
 rising_30 = query_snapshots("international_top_rising_terms", d, 30)
+start_7 = d - timedelta(days=6)
+start_1 = d
+
+top_7 = since(top_30, start_7)
+rising_7 = since(rising_30, start_7)
+top_1 = since(top_30, start_1)
+rising_1 = since(rising_30, start_1)
+
 periods = {
-    "current": make_period(top_1, rising_1, 1),
-    "weekly": make_period(top_7, rising_7, 7),
-    "monthly": make_period(top_30, rising_30, 30),
+    "current": make_period(top_1, rising_1),
+    "weekly": make_period(top_7, rising_7),
+    "monthly": make_period(top_30, rising_30),
 }
 payload = {
     "refresh_date": d.isoformat(),
@@ -119,5 +127,14 @@ raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 (ARCHIVE / f"{d.isoformat()}.json").write_text(raw, encoding="utf-8")
 (DATA / "latest.json").write_text(raw, encoding="utf-8")
 dates = sorted(p.stem for p in ARCHIVE.glob("*.json"))
-(DATA / "manifest.json").write_text(json.dumps({"latest": d.isoformat(), "dates": dates, "region_count": len(periods["current"]["regions"]), "periods": {k: v["snapshot_days"] for k, v in periods.items()}, "period_score_method": "daily_top25_rank_points"}, ensure_ascii=False, indent=2), encoding="utf-8")
+(DATA / "manifest.json").write_text(
+    json.dumps({
+        "latest": d.isoformat(),
+        "dates": dates,
+        "region_count": len(periods["current"]["regions"]),
+        "periods": {k: v["snapshot_days"] for k, v in periods.items()},
+        "period_score_method": "daily_top25_rank_points",
+    }, ensure_ascii=False, indent=2),
+    encoding="utf-8",
+)
 print(f"{d}: current={periods['current']['snapshot_days']}d weekly={periods['weekly']['snapshot_days']}d monthly={periods['monthly']['snapshot_days']}d; {len(periods['current']['regions'])} regions")
