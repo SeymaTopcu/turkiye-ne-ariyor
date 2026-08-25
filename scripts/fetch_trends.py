@@ -16,13 +16,28 @@ MAX_BYTES = 250 * 1024 * 1024
 
 
 def query(table: str, target: date):
+    # Each refresh contains historical weekly observations for the current Top 25.
+    # We want one row per current term, so retain the most recent week in that refresh.
     sql = f"""
-    SELECT refresh_date, region_code, region_name, term, rank, score
-    FROM `bigquery-public-data.google_trends.{table}`
-    WHERE refresh_date = @refresh_date
-      AND country_code = 'TR'
-      AND region_name IS NOT NULL
-    ORDER BY region_name, rank
+    WITH snapshot AS (
+      SELECT refresh_date, region_code, region_name, term, rank, week, score
+      FROM `bigquery-public-data.google_trends.{table}`
+      WHERE refresh_date = @refresh_date
+        AND country_code = 'TR'
+        AND region_name IS NOT NULL
+    ), latest_week AS (
+      SELECT region_code, MAX(week) AS week
+      FROM snapshot
+      GROUP BY region_code
+    )
+    SELECT s.refresh_date, s.region_code, s.region_name, s.term, s.rank, s.week, s.score
+    FROM snapshot s
+    JOIN latest_week w USING (region_code, week)
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY s.region_code, s.term, s.rank
+      ORDER BY s.week DESC
+    ) = 1
+    ORDER BY s.region_name, s.rank
     """
     cfg = bigquery.QueryJobConfig(
         query_parameters=[bigquery.ScalarQueryParameter("refresh_date", "DATE", target.isoformat())],
@@ -49,6 +64,7 @@ def normalize(rows):
         out.setdefault(region, []).append({
             "term": r["term"],
             "rank": int(r["rank"]) if r.get("rank") is not None else None,
+            "week": r["week"].isoformat() if r.get("week") else None,
             "score": float(r["score"]) if r.get("score") is not None else None,
         })
     return out
@@ -57,7 +73,13 @@ def normalize(rows):
 d, top_rows, rising_rows = find_latest()
 top, rising = normalize(top_rows), normalize(rising_rows)
 regions = {r: {"top": top.get(r, []), "rising": rising.get(r, [])} for r in sorted(set(top) | set(rising))}
-payload = {"refresh_date": d.isoformat(), "country_code": "TR", "source": "bigquery-public-data.google_trends", "regions": regions}
+payload = {
+    "refresh_date": d.isoformat(),
+    "country_code": "TR",
+    "source": "bigquery-public-data.google_trends",
+    "note": "Top 25 terms from the refresh snapshot; score is the latest weekly score when Google supplies it.",
+    "regions": regions,
+}
 raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
 (ARCHIVE / f"{d.isoformat()}.json").write_text(raw, encoding="utf-8")
 (DATA / "latest.json").write_text(raw, encoding="utf-8")
