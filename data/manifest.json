@@ -1,13 +1,14 @@
 {
-  "latest": "2026-08-24",
+  "latest": "2026-08-25",
   "dates": [
-    "2026-08-24"
+    "2026-08-24",
+    "2026-08-25"
   ],
   "region_count": 81,
   "periods": {
-    "weekly": 1,
-    "monthly": 4,
-    "yearly": 52
+    "current": 1,
+    "weekly": 7,
+    "monthly": 30
   },
-  "period_score_method": "sum_weekly_relative_interest"
+  "period_score_method": "daily_top25_rank_points"
 }
